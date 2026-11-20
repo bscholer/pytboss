@@ -148,7 +148,11 @@ class FakeTransport(Transport):
         psw = bytes.fromhex(params["psw"])
         if not psw:
             raise Unauthorized
-        if decode(psw, key=timed_key(self._uptime())).decode() != self.password:
+        try:
+            supplied = decode(psw, key=timed_key(self._uptime())).decode()
+        except UnicodeDecodeError:
+            raise Unauthorized from None
+        if supplied != self.password:
             raise Unauthorized
 
     def _uptime(self) -> float:
@@ -529,6 +533,21 @@ async def test_get_state(conn: FakeTransport, password: str):
     want: dict[str, Any] = STATE_DICT.copy()
     want.update(TEMPS_DICT)
     assert (await pitboss.get_state()) == want
+
+
+async def test_unauthorized_is_retried_once_on_a_fresh_uptime():
+    pitboss = api.PitBoss(FakeTransport("secret"), "PBV4PS2", "secret")
+    await pitboss.start()
+    await pitboss.get_state()
+    pitboss._last_uptime = (pitboss._last_uptime or 0.0) + 5000.0
+    assert await pitboss.get_state()
+
+
+async def test_unauthorized_with_a_wrong_password_is_still_raised():
+    pitboss = api.PitBoss(FakeTransport("secret"), "PBV4PS2", "wrong")
+    await pitboss.start()
+    with pytest.raises(Unauthorized):
+        await pitboss.get_state()
 
 
 async def test_get_uptime_is_extrapolated_between_reads(pitboss: api.PitBoss):

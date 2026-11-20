@@ -11,7 +11,7 @@ from typing import Any
 
 from .codec import WIFI_KEY, encode, timed_key
 from .config import Config
-from .exceptions import RPCError, UnsupportedOperation
+from .exceptions import RPCError, Unauthorized, UnsupportedOperation
 from .fs import FileSystem
 from .grills import Grill, StateDict, get_grill
 from .ota import OTA
@@ -279,10 +279,26 @@ class PitBoss:
         psw = encode(self._password, key=timed_key(await self.get_uptime())).hex()
         return {**params, "psw": psw}
 
+    async def _send_authenticated(self, method: str, params: dict) -> RPCResult:
+        """Send `method` with the password key, retrying `Unauthorized` once.
+
+        The key comes from a cached uptime, which a grill restart makes stale.
+        """
+        try:
+            return await self._conn.send_command(
+                method, await self._authenticate(params)
+            )
+        except Unauthorized:
+            if not self._password:
+                raise
+            _LOGGER.debug("%s rejected; retrying on a fresh uptime", method)
+            self._last_uptime = None
+            return await self._conn.send_command(
+                method, await self._authenticate(params)
+            )
+
     async def _send_hex_command(self, cmd: str) -> RPCResult:
-        return await self._conn.send_command(
-            "PB.SendMCUCommand", await self._authenticate({"command": cmd})
-        )
+        return await self._send_authenticated("PB.SendMCUCommand", {"command": cmd})
 
     async def _send_command(self, slug: str, *args) -> RPCResult:
         cmd = self.spec.control_board.commands[slug]
@@ -294,9 +310,8 @@ class PitBoss:
         :param new_password: The new password to set.
         """
         new_password_bytes = new_password.encode("utf-8")
-        await self._conn.send_command(
-            "PB.SetDevicePassword",
-            await self._authenticate({"newPassword": encode(new_password_bytes).hex()}),
+        await self._send_authenticated(
+            "PB.SetDevicePassword", {"newPassword": encode(new_password_bytes).hex()}
         )
         self._password = new_password_bytes
 
@@ -488,7 +503,7 @@ class PitBoss:
         Returns nothing: the firmware handler ends in `return null`, so there
         is no result to hand back.
         """
-        await self._conn.send_command("PB.WiFiAwakeWDT", await self._authenticate({}))
+        await self._send_authenticated("PB.WiFiAwakeWDT", {})
 
     async def set_temperature_unit(self, fahrenheit: bool) -> RPCResult:
         """Switches the unit the grill itself works in.
@@ -584,9 +599,7 @@ class PitBoss:
         anything relying on it stays correct on a connection that only ever
         polls.
         """
-        resp = as_dict(
-            await self._conn.send_command("PB.GetState", await self._authenticate({}))
-        )
+        resp = as_dict(await self._send_authenticated("PB.GetState", {}))
         # Either frame can be absent or empty, so neither is indexed. The
         # firmware blanks both the moment it forwards a command to the MCU::
         #
@@ -629,9 +642,8 @@ class PitBoss:
 
         :meta private:
         """
-        return await self._conn.send_command(
-            "PB.SetWiFiUpdateFrequency",
-            await self._authenticate({"slow": slow, "fast": fast}),
+        return await self._send_authenticated(
+            "PB.SetWiFiUpdateFrequency", {"slow": slow, "fast": fast}
         )
 
     async def set_virtual_data(self, data: dict) -> RPCResult:
@@ -639,9 +651,7 @@ class PitBoss:
 
         :meta private:
         """
-        return await self._conn.send_command(
-            "PB.SetVirtualData", await self._authenticate(data)
-        )
+        return await self._send_authenticated("PB.SetVirtualData", data)
 
     async def get_virtual_data(self) -> dict:
         """Retrieves virtual data previously set with `set_virtual_data()`.
@@ -658,9 +668,7 @@ class PitBoss:
 
         :meta private:
         """
-        data = await self._conn.send_command(
-            "PB.GetVirtualData", await self._authenticate({})
-        )
+        data = await self._send_authenticated("PB.GetVirtualData", {})
         if isinstance(data, dict):
             return {k: v for k, v in data.items() if k != "psw"}
         return {}
@@ -838,9 +846,7 @@ class PitBoss:
         :raise pytboss.exceptions.RPCError: If the firmware rejects the name.
         """
         result = as_dict(
-            await self._conn.send_command(
-                "PB.RenameDevice", await self._authenticate({"name": name})
-            )
+            await self._send_authenticated("PB.RenameDevice", {"name": name})
         )
         return result.get("newName", "")
 
@@ -862,14 +868,12 @@ class PitBoss:
         :param ssid: The network to join.
         :param password: The network's password.
         """
-        return await self._conn.send_command(
+        return await self._send_authenticated(
             "PB.SetWifiCredentials",
-            await self._authenticate(
-                {
-                    "ssid": ssid,
-                    "pass": encode(password.encode("utf-8"), key=WIFI_KEY).hex(),
-                }
-            ),
+            {
+                "ssid": ssid,
+                "pass": encode(password.encode("utf-8"), key=WIFI_KEY).hex(),
+            },
         )
 
     async def debug_pstate(self) -> str:
@@ -884,9 +888,5 @@ class PitBoss:
 
         Diagnostic only. Nothing in this library acts on it.
         """
-        result = as_dict(
-            await self._conn.send_command(
-                "PB.DebugPState", await self._authenticate({})
-            )
-        )
+        result = as_dict(await self._send_authenticated("PB.DebugPState", {}))
         return result.get("pState", "")
